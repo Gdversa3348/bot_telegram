@@ -144,3 +144,19 @@ def export_all_transactions(start_date: datetime.date | None = None, end_date: d
         return cur.fetchall()
     finally:
         conn.close()
+
+def delete_user_data(user_id: int) -> None:
+    """Apaga todos os dados de um usuário específico.
+    
+    Args:
+        user_id: ID do usuário no Telegram
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        with conn:
+            # Apaga todas as transações do usuário
+            conn.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+            # Apaga todas as interações do usuário
+            conn.execute("DELETE FROM interactions WHERE user_id = ?", (user_id,))
+    finally:
+        conn.close()
