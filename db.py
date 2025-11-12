@@ -160,3 +160,28 @@ def delete_user_data(user_id: int) -> None:
             conn.execute("DELETE FROM interactions WHERE user_id = ?", (user_id,))
     finally:
         conn.close()
+
+def update_transaction(transaction_id: int, amount: float, date: datetime.date, description: str | None = None):
+    """Atualiza uma transação existente identificada por transaction_id."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE transactions SET amount = ?, date = ?, description = ? WHERE id = ?",
+                (amount, date.isoformat(), description, transaction_id)
+            )
+    finally:
+        conn.close()
+
+def get_transactions_by_date(user_id: int, date: datetime.date):
+    """Retorna todas as transações de um usuário em uma data específica."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, amount, date, description, created_at FROM transactions WHERE user_id = ? AND date = ? ORDER BY id DESC",
+            (user_id, date.isoformat())
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()

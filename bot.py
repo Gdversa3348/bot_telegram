@@ -15,6 +15,8 @@ print(f"[INFO] OCR engine detected: {OCR_ENGINE}")
 
 # Armazena recepientes pendentes para interação por usuário
 pending_receipts: dict = {}
+# Armazena sessões de edição de transações por usuário
+edit_sessions: dict = {}
 
 # Removida variável global dados - agora usamos apenas o banco SQLite
 
@@ -345,6 +347,117 @@ async def callback_add_receipt(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
 
+
+async def editar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia fluxo de edição: pede ao usuário a data das transações a editar."""
+    user = update.effective_user
+    if not user or not user.id:
+        await update.message.reply_text("⚠️ Erro: não foi possível identificar o usuário.")
+        return
+
+    edit_sessions[user.id] = {'stage': 'await_date'}
+    await update.message.reply_text("🛠️ Envie a data das transações que deseja editar (DD/MM/YYYY) ou use 'hoje'/'ontem'. Para cancelar, envie /cancelar.")
+
+
+async def callback_edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback quando o usuário escolhe qual transação editar (via inline keyboard)."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or not user.id:
+        await query.edit_message_text("⚠️ Erro: usuário não identificado.")
+        return
+
+    data = query.data or ''
+    try:
+        _, tx_id_str = data.split(':', 1)
+        tx_id = int(tx_id_str)
+    except Exception:
+        await query.edit_message_text("⚠️ Dados inválidos.")
+        return
+
+    session = edit_sessions.get(user.id)
+    if not session:
+        await query.edit_message_text("⏳ Sessão expirada. Inicie novamente com /editar.")
+        return
+
+    # encontra a transação selecionada na lista carregada
+    trans_list = session.get('transactions', [])
+    chosen = None
+    for row in trans_list:
+        if row[0] == tx_id:
+            chosen = row
+            break
+
+    if not chosen:
+        await query.edit_message_text("⚠️ Transação não encontrada na sessão. Inicie novamente com /editar.")
+        try:
+            del edit_sessions[user.id]
+        except Exception:
+            pass
+        return
+
+    # Guarda original e muda etapa para receber novos dados
+    # chosen: (id, amount, date, description, created_at)
+    orig_amount = chosen[1]
+    orig_date = datetime.date.fromisoformat(chosen[2]) if isinstance(chosen[2], str) else chosen[2]
+    orig_desc = chosen[3]
+
+    session['tx_id'] = tx_id
+    session['original'] = (orig_amount, orig_date, orig_desc)
+    session['stage'] = 'await_new'
+
+    await query.edit_message_text(
+        f"✏️ Você escolheu: R$ {abs(orig_amount):.2f} em {orig_date.strftime('%d/%m/%Y')} - {orig_desc}\n\nEnvie os novos dados no formato: valor; data; descrição\nEx: -89.90; 01/11/2025; Mercado"
+    )
+
+
+async def callback_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or not user.id:
+        await query.edit_message_text("⚠️ Erro: usuário não identificado.")
+        return
+
+    session = edit_sessions.get(user.id)
+    if not session or session.get('stage') != 'await_confirm':
+        await query.edit_message_text("⏳ Nenhuma alteração pendente ou sessão expirada.")
+        return
+
+    tx_id = session.get('tx_id')
+    new = session.get('new')
+    if not tx_id or not new:
+        await query.edit_message_text("⚠️ Dados incompletos. Inicie o processo novamente com /editar.")
+        try:
+            del edit_sessions[user.id]
+        except Exception:
+            pass
+        return
+
+    try:
+        db.update_transaction(tx_id, float(new['amount']), new['date'], new['description'])
+        await query.edit_message_text(f"✅ Transação atualizada com sucesso: R$ {abs(new['amount']):.2f} em {new['date'].strftime('%d/%m/%Y')} - {new['description']}")
+    except Exception as e:
+        await query.edit_message_text(f"❌ Erro ao atualizar transação: {str(e)}")
+
+    try:
+        del edit_sessions[user.id]
+    except Exception:
+        pass
+
+
+async def callback_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if user and user.id in edit_sessions:
+        try:
+            del edit_sessions[user.id]
+        except Exception:
+            pass
+    await query.edit_message_text("✅ Edição cancelada. Nenhuma alteração foi realizada.")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 Olá! Eu sou seu bot de orçamento pessoal.\n\n"
@@ -401,6 +514,17 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "5. Apagar todos os seus dados:\n"
         "   /limpar\n"
         "   ⚠️ Esta ação é irreversível!\n\n"
+        "6. Editar transações por data:\n"
+            "   /editar\n"
+            "   🛠️ Permite selecionar transações de uma data e sobrescrever os dados.\n"
+            "\n"
+            "Como usar /editar (passo a passo):\n"
+            "1. Envie /editar para iniciar o fluxo.\n"
+            "2. Envie a data das transações que deseja editar (DD/MM/YYYY) ou use 'hoje'/'ontem'.\n"
+            "3. Selecione a transação desejada no teclado que aparecerá.\n"
+            "4. Envie os novos dados no formato: valor; data; descrição\n"
+            "   Ex: -89.90; 01/11/2025; Mercado\n"
+            "5. Confirme a alteração no botão 'Confirmar alteração' ou cancele.\n\n"
         "�💡 Dicas:\n"
         "- Use datas completas (DD/MM/AAAA) para registros passados\n"
         "- Use 'hoje', 'ontem', 'amanhã' para registros recentes\n"
@@ -417,6 +541,115 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def registrar_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Se o usuário está em um fluxo de edição, processa esse fluxo antes
+    user = update.effective_user
+    if user and user.id in edit_sessions:
+        session = edit_sessions[user.id]
+        stage = session.get('stage')
+
+        # Esperando a data para buscar transações
+        if stage == 'await_date':
+            text = update.message.text.strip()
+            # parse data (aceita hoje/ontem/amanha ou DD/MM/YYYY)
+            def parse_date_str(s: str):
+                s = s.lower().strip()
+                hoje = datetime.date.today()
+                if s == 'hoje':
+                    return hoje
+                if s == 'ontem':
+                    return hoje - datetime.timedelta(days=1)
+                if s == 'amanha' or s == 'amanhã':
+                    return hoje + datetime.timedelta(days=1)
+                try:
+                    if '/' in s:
+                        parts = s.split('/')
+                        if len(parts) == 3:
+                            d, m, y = map(int, parts)
+                            if y < 100:
+                                y += 2000
+                            return datetime.date(y, m, d)
+                        elif len(parts) == 2:
+                            d, m = map(int, parts)
+                            year = hoje.year
+                            dt = datetime.date(year, m, d)
+                            if dt > hoje:
+                                dt = datetime.date(year - 1, m, d)
+                            return dt
+                except Exception:
+                    return None
+                return None
+
+            target_date = parse_date_str(text)
+            if not target_date:
+                await update.message.reply_text("⚠️ Data inválida. Envie no formato DD/MM/YYYY ou use 'hoje'/'ontem'.")
+                return
+
+            # Buscar transações nessa data
+            trans = db.get_transactions_by_date(user.id, target_date)
+            if not trans:
+                await update.message.reply_text(f"📌 Nenhuma transação encontrada em {target_date.strftime('%d/%m/%Y')}.")
+                del edit_sessions[user.id]
+                return
+
+            # Monta teclado com opções para o usuário escolher qual transação editar
+            keyboard = []
+            mensagens = [f"Transações em {target_date.strftime('%d/%m/%Y')}:\n"]
+            for i, (tx_id, amount, date_str, desc, created_at) in enumerate(trans, start=1):
+                sinal = '+' if amount > 0 else '-'
+                desc_fmt = f" ({desc})" if desc else ''
+                mensagens.append(f"{i}) {sinal}R$ {abs(amount):.2f}{desc_fmt}")
+                keyboard.append([InlineKeyboardButton(f"{i}) {sinal}R$ {abs(amount):.2f}", callback_data=f"edit_choose:{tx_id}")])
+
+            keyboard.append([InlineKeyboardButton("Cancelar", callback_data="edit_cancel")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text("\n".join(mensagens), reply_markup=reply_markup)
+            # Armazena as transações na sessão para referência
+            session['transactions'] = trans
+            session['stage'] = 'await_choice'
+            session['date'] = target_date
+            return
+
+        # Esperando novos dados para sobreescrever a transação
+        if stage == 'await_new':
+            if not update.message or not update.message.text:
+                await update.message.reply_text("⚠️ Envie os novos dados no formato: valor; data; descrição")
+                return
+
+            parsed = parse_message(update.message.text.strip())
+            if not parsed:
+                await update.message.reply_text("⚠️ Formato inválido. Use: valor; data; descrição (ex: -89.90; 01/11/2025; Mercado)")
+                return
+
+            new_amount, new_date, new_desc = parsed
+            session['new'] = {
+                'amount': new_amount,
+                'date': new_date,
+                'description': new_desc
+            }
+
+            # Mostra confirmação antes de persistir
+            orig = session.get('original')
+            orig_amount = orig[0] if orig else None
+            orig_date = orig[1] if orig else None
+            orig_desc = orig[2] if orig else None
+
+            txt = (
+                f"📝 Você está prestes a atualizar a transação:\n\n"
+                f"Antes: R$ {abs(orig_amount):.2f} em {orig_date.strftime('%d/%m/%Y')} - {orig_desc}\n"
+                f"Depois: R$ {abs(new_amount):.2f} em {new_date.strftime('%d/%m/%Y')} - {new_desc}\n\n"
+                "Confirma a alteração?"
+            )
+
+            keyboard = [
+                [InlineKeyboardButton("Confirmar alteração", callback_data='edit_confirm')],
+                [InlineKeyboardButton("Cancelar", callback_data='edit_cancel')]
+            ]
+            await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(keyboard))
+            session['stage'] = 'await_confirm'
+            return
+
+    # Fluxo normal de registrar_valor continua abaixo
     if not update.message or not update.message.text:
         return
 
@@ -844,6 +1077,75 @@ async def cancelar_limpeza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Processo de limpeza cancelado. Seus dados estão seguros.")
     return ConversationHandler.END
 
+
+async def cancelar_edicao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela qualquer sessão de edição em andamento para o usuário."""
+    user = update.effective_user
+    if not user or not user.id:
+        await update.message.reply_text("⚠️ Erro: usuário não identificado.")
+        return
+
+    if user.id in edit_sessions:
+        try:
+            del edit_sessions[user.id]
+        except Exception:
+            pass
+        await update.message.reply_text("✅ Edição cancelada. Nenhuma alteração foi realizada.")
+    else:
+        # Se não houver sessão de edição, apenas encaminha para o handler de limpar (se existir)
+        await update.message.reply_text("⚠️ Não há nenhum processo de edição em andamento.")
+    return
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler para comandos desconhecidos (ex.: /comando_inexistente)."""
+    try:
+        user = update.effective_user
+        cmd = update.message.text.strip() if update.message and update.message.text else '<desconhecido>'
+        await update.message.reply_text(
+            f"⚠️ Comando não reconhecido: {cmd}\nUse /ajuda para ver os comandos disponíveis."
+        )
+        # Log
+        try:
+            db.log_interaction(user.id if user else None, getattr(user, 'username', None), cmd, 'unknown_command', {'command': 'unknown'})
+        except Exception:
+            pass
+    except Exception:
+        # segurança: não falhar o bot
+        pass
+
+
+async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler genérico quando nenhuma outra ação/handler corresponder.
+    Ex.: stickers, áudios, documentos sem imagem, ou outros updates não tratados.
+    """
+    try:
+        user = update.effective_user
+        # Mensagem padrão orientando o usuário
+        txt = (
+            "🤖 Desculpe, não entendi essa ação.\n\n"
+            "Tente uma das opções:\n"
+            "- Envie texto no formato: valor; data; descrição (ex: -89.90; 01/11/2025; Mercado)\n"
+            "- Use /ajuda para ver comandos disponíveis\n"
+            "- Use /editar para editar transações por data"
+        )
+        if update.message:
+            await update.message.reply_text(txt)
+        else:
+            # caso não seja uma mensagem (ex: callback_query), tente responder generically
+            try:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=txt)
+            except Exception:
+                pass
+
+        # Log simplificado
+        try:
+            db.log_interaction(user.id if user else None, getattr(user, 'username', None), 'unknown_update', 'unknown_message', None)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 def main():
     # Inicializa banco de dados
     try:
@@ -875,7 +1177,8 @@ def main():
             {"command": "ajuda", "description": "Ver instruções de uso e formatos"},
             {"command": "resumo", "description": "Resumo geral ou de mês (/resumo mes MM/YYYY)"},
             {"command": "extrato", "description": "Extrato por mês ou período"},
-            {"command": "limpar", "description": "Apagar todos os seus dados (confirmação)"}
+            {"command": "limpar", "description": "Apagar todos os seus dados (confirmação)"},
+            {"command": "editar", "description": "Editar transações por data"}
         ]
 
         # Faz uma chamada HTTP síncrona para setMyCommands usando urllib (evita criar/fechar loops asyncio)
@@ -921,6 +1224,7 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ajuda", ajuda))
+    app.add_handler(CommandHandler("cancelar", cancelar_edicao))
     app.add_handler(CommandHandler("resumo", resumo))
     app.add_handler(CommandHandler("extrato", extrato))
     app.add_handler(limpar_handler)
@@ -931,7 +1235,16 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_confirm_type, pattern=r'^confirm:'))
     app.add_handler(CallbackQueryHandler(callback_cancel_receipt, pattern=r'^cancel_receipt$'))
     app.add_handler(CallbackQueryHandler(callback_add_receipt, pattern=r'^add_receipt$'))
+    # Handlers para edição de transações
+    app.add_handler(CommandHandler("editar", editar_start))
+    app.add_handler(CallbackQueryHandler(callback_edit_choose, pattern=r'^edit_choose:'))
+    app.add_handler(CallbackQueryHandler(callback_edit_confirm, pattern=r'^edit_confirm$'))
+    app.add_handler(CallbackQueryHandler(callback_edit_cancel, pattern=r'^edit_cancel$'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registrar_valor))
+    # Handler para comandos desconhecidos (deve ser registrado após TODOS os comandos conhecidos)
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    # Handler genérico para qualquer update/mensagem não tratada por handlers acima
+    app.add_handler(MessageHandler(filters.ALL, unknown_message))
     app.run_polling()
 
 if __name__ == "__main__":
