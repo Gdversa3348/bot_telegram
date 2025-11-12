@@ -1,0 +1,9 @@
+python-telegram-bot>=20.0
+pillow
+python-dateutil
+pytesseract
+easyocr
+paddleocr
+paddlepaddle
+opencv-python
+pandas
